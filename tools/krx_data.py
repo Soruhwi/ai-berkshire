@@ -243,6 +243,90 @@ def cmd_search(keyword: str):
 
 
 # ---------------------------------------------------------------------------
+# API 헬퍼 — 대시보드 등에서 호출. dict/list(JSON 직렬화 가능)를 반환.
+# (CLI cmd_* 는 출력 전용이라 별도로 둔다)
+# ---------------------------------------------------------------------------
+
+def api_quote(code: str) -> dict:
+    code = _clean_code(code)
+    d = _fetch_quote(code)
+    if not d:
+        return {"error": f"종목을 찾을 수 없음: {code}"}
+    return {
+        "code": code,
+        "name": d.get("stockName"),
+        "exchange": d.get("stockExchangeType", {}).get("nameKor", ""),
+        "currency": d.get("currencyType", {}).get("code", "KRW"),
+        "price": d.get("closePrice"),
+        "change": d.get("compareToPreviousClosePrice"),
+        "changeRate": d.get("fluctuationsRatio"),
+        "open": d.get("openPrice"),
+        "high": d.get("highPrice"),
+        "low": d.get("lowPrice"),
+        "volume": d.get("accumulatedTradingVolume"),
+        "tradingValue": d.get("accumulatedTradingValue"),
+        "marketCap": _won(d.get("marketValueFullRaw")),
+        "marketStatus": d.get("marketStatus"),
+        "tradedAt": d.get("localTradedAt"),
+    }
+
+
+def api_valuation(code: str) -> dict:
+    code = _clean_code(code)
+    d = _fetch_integration(code)
+    infos = {i.get("code"): i.get("value") for i in d.get("totalInfos", [])}
+    keys = ["marketValue", "per", "cnsPer", "eps", "cnsEps", "pbr", "bps",
+            "dividendYieldRatio", "dividend", "foreignRate",
+            "highPriceOf52Weeks", "lowPriceOf52Weeks"]
+    return {
+        "code": code,
+        "name": d.get("stockName", code),
+        "metrics": {k: infos.get(k) for k in keys if k in infos},
+    }
+
+
+def api_financials(code: str) -> dict:
+    code = _clean_code(code)
+    try:
+        d = _get_json(f"https://m.stock.naver.com/api/stock/{code}/finance/annual")
+    except ConnectionError:
+        return {"error": f"재무 데이터를 가져오지 못함: {code}"}
+    fin = d.get("financeInfo", {})
+    rows = fin.get("rowList", [])
+    col_keys = sorted({k for r in rows for k in (r.get("columns") or {})})
+    name = d.get("corporationSummary", {}).get("corpName")
+    if not name:
+        try:
+            name = _fetch_quote(code).get("stockName") or code
+        except Exception:
+            name = code
+    want = ["매출액", "영업이익", "당기순이익", "영업이익률", "순이익률",
+            "ROE", "부채비율", "EPS", "PER", "BPS", "PBR", "주당배당금"]
+    by_title = {r.get("title"): (r.get("columns") or {}) for r in rows}
+    table = []
+    for title in want:
+        cols = by_title.get(title)
+        if not cols:
+            continue
+        table.append({"title": title,
+                      "values": [(cols.get(k) or {}).get("value", "-") for k in col_keys]})
+    return {"code": code, "name": name, "unit": "억원/%", "periods": col_keys, "rows": table}
+
+
+def api_search(keyword: str) -> list:
+    q = _urlquote(keyword)
+    url = f"https://m.stock.naver.com/front-api/search/autoComplete?query={q}&target=stock"
+    try:
+        data = _get_json(url)
+    except ConnectionError:
+        return []
+    items = data.get("result", {}).get("items", [])
+    return [{"code": it.get("code"), "name": it.get("name"),
+             "type": it.get("typeName"), "nation": it.get("nationName")}
+            for it in items[:10]]
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
