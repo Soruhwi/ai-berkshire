@@ -1,5 +1,5 @@
 ---
-description: "AI Berkshire slash entry for 微信公众号文章：作者-编辑-读者三Agent协作."
+description: "AI Berkshire slash entry for 블로그/뉴스레터 글: 작가-편집-독자 3-Agent 협업."
 argument-hint: $ARGUMENTS
 ---
 
