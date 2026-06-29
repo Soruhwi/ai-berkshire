@@ -99,12 +99,23 @@ def _content_tree():
 # AI 리포트 생성 — claude CLI를 헤드리스(-p)로 호출해 실제 워크플로 가동
 # ---------------------------------------------------------------------------
 
-# 리포트 종류 → (skill 파일, 파일명 suffix, 타임아웃 초, 라벨)
+# 리포트 종류 → (skill 파일, 파일명 suffix, 타임아웃 초, 라벨, 비용상한 USD)
+# 비용상한은 환경변수 AIB_REPORT_BUDGET_USD 로 일괄 덮어쓸 수 있음.
 REPORT_KINDS = {
-    "checklist": ("investment-checklist.md", "checklist", 900, "빠른 체크리스트"),
-    "research": ("investment-research.md", "research", 1500, "종합 리서치"),
-    "team": ("investment-team.md", "team", 2400, "멀티에이전트 팀"),
+    "checklist": ("investment-checklist.md", "checklist", 900, "빠른 체크리스트", 6),
+    "research": ("investment-research.md", "research", 1800, "종합 리서치", 20),
+    "team": ("investment-team.md", "team", 2700, "멀티에이전트 팀", 30),
 }
+
+
+def _budget_for(kind: str) -> str:
+    env = os.environ.get("AIB_REPORT_BUDGET_USD")
+    if env:
+        try:
+            return str(float(env))
+        except ValueError:
+            pass
+    return str(REPORT_KINDS[kind][4])
 
 JOBS = {}            # id -> dict(status, kind, code, name, started, path, error)
 JOBS_LOCK = threading.Lock()
@@ -142,15 +153,17 @@ def _build_prompt(kind: str, code: str, name: str) -> str:
         f" 지침에 '확인 후 시작', '진행할까요?', '团队框架确认' 같은 확인·승인 단계가 있어도"
         f" 전부 건너뛰고, 워크플로 전체를 처음부터 끝까지 자율적으로 완수하라."
         f" 절대로 질문으로 끝내지 말 것.\n"
-        f"- 지침에 팀 생성(TeamCreate/TaskCreate)·서브에이전트 호출이 있어도, 그런 도구에 의존하지 말고"
-        f" **4대가(돤융핑·버핏·멍거·리루) 관점 분석을 네가 직접 모두 작성**하고 최종 종합 보고서까지 완성하라.\n"
+        f"- 지침에 팀 생성(TeamCreate/TaskCreate)·서브에이전트·Task·백그라운드 작업이 있어도"
+        f" **그런 도구를 절대 쓰지 마라.** 네가 직접 4대가(돤융핑·버핏·멍거·리루) 관점 분석을 모두 작성하고"
+        f" 최종 종합까지 한 번에 완성하라. (WebSearch·Bash/krx_data 같은 데이터 조회 도구는 사용 가능)\n"
+        f"- **리포트 전문을 단 하나의 최종 응답 메시지에 담아 출력하라.** 여러 메시지로 나누지 말고,"
+        f" '위 리포트', '앞서 작성한' 같은 이전 메시지 참조 금지. 마지막 메시지만으로 완결된 리포트가 되어야 한다.\n"
         f"- 모든 출력은 한국어로 작성한다.\n"
         f"- 실제 수치가 필요하면 `python tools/krx_data.py quote|valuation|financials {code}`"
         f" 와 WebSearch로 데이터를 확보하고 출처를 표기한다.\n"
         f"- 객관성 원칙(사실/관점 구분, 양면 제시, 추정은 '추정' 명기)을 지킨다.\n"
-        f"- **최종 출력은 완성된 리서치 리포트의 마크다운 본문 하나뿐이다.**"
-        f" 파일을 직접 생성하지 말고, 진행 설명·확인 질문·도구 로그 없이 리포트 전문만 반환하라."
-        f" (저장은 외부에서 처리한다.)\n"
+        f"- 파일을 직접 생성하지 말고, 진행 설명·확인 질문·도구 로그 없이"
+        f" **완성된 리서치 리포트의 마크다운 본문만** 최종 출력으로 반환하라. (저장은 외부에서 처리한다.)\n"
     )
 
 
@@ -161,10 +174,11 @@ def _run_report_job(job_id: str, kind: str, code: str, name: str):
         timeout = REPORT_KINDS[kind][2]
         comspec = os.environ.get("COMSPEC", "cmd.exe")
         # claude.cmd 는 cmd /c 로 실행, 프롬프트는 stdin(마크다운 메타문자 안전)
+        budget = _budget_for(kind)
         cmd = [comspec, "/c", CLAUDE_BIN, "-p",
                "--output-format", "text",
                "--permission-mode", "bypassPermissions",
-               "--max-budget-usd", "4",
+               "--max-budget-usd", budget,
                "--no-session-persistence"]
         proc = subprocess.run(
             cmd, input=prompt, capture_output=True, text=True, encoding="utf-8",
@@ -175,6 +189,16 @@ def _run_report_job(job_id: str, kind: str, code: str, name: str):
             raise RuntimeError((proc.stderr or "claude 실행 실패").strip()[:500])
         if not out:
             raise RuntimeError("빈 결과(리포트 생성 실패)")
+        # 예산 초과/오류 출력을 리포트로 저장하지 않음
+        if "Exceeded USD budget" in out:
+            raise RuntimeError(f"비용 상한(${budget}) 초과로 미완료. 서버를 "
+                               f"`AIB_REPORT_BUDGET_USD=<더 큰 값>` 으로 재시작하거나 더 가벼운 종류로 시도하세요.")
+        if len(out) < 300 and out.lower().startswith("error"):
+            raise RuntimeError(out[:300])
+        # 비정상적으로 짧으면 워크플로 미완결(부분 캡처) 가능성 → 저장하지 않음
+        if len(out) < 1500:
+            raise RuntimeError(f"출력이 너무 짧습니다({len(out)}자). 워크플로가 끝까지 완결되지 "
+                               f"않았을 수 있습니다. 다시 시도하거나 더 가벼운 종류를 선택하세요.")
 
         suffix = REPORT_KINDS[kind][1]
         today = datetime.date.today().strftime("%Y%m%d")
@@ -265,7 +289,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {
                 "available": bool(CLAUDE_BIN),
                 "bin": CLAUDE_BIN,
-                "kinds": [{"id": k, "label": v[3]} for k, v in REPORT_KINDS.items()],
+                "kinds": [{"id": k, "label": v[3], "budget": _budget_for(k),
+                           "minutes": round(v[2] / 60)} for k, v in REPORT_KINDS.items()],
             })
 
         # ---- 정적 파일 ----

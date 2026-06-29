@@ -152,9 +152,10 @@ function renderReportPanel(code, name) {
     box.innerHTML = `<h3>🤖 AI 리포트 생성</h3><p class="hint">claude CLI를 찾지 못해 비활성화됨. Claude Code 설치 후 서버를 재시작하세요.</p>`;
     return;
   }
-  const opts = reportCfg.kinds.map((k) => `<option value="${k.id}">${k.label}</option>`).join("");
+  const opts = reportCfg.kinds.map((k) =>
+    `<option value="${k.id}">${k.label} (~${k.minutes}분, 상한 $${k.budget})</option>`).join("");
   box.innerHTML = `<h3>🤖 AI 리포트 생성</h3>
-    <p class="hint">4대가 워크플로를 실제로 가동해 ${name} 리포트를 생성하고 <code>reports/${name}/</code> 에 저장합니다. 종류에 따라 수 분 소요.</p>
+    <p class="hint">4대가 워크플로를 실제로 가동해 ${name} 리포트를 생성하고 <code>reports/${name}/</code> 에 저장합니다. 확인 절차 없이 끝까지 자율 실행되며, 비용은 종류별 상한 내에서 Claude 사용량으로 과금됩니다.</p>
     <div class="ai-controls">
       <select id="aiKind">${opts}</select>
       <button id="aiGo">생성 시작</button>
