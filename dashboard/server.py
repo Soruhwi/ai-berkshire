@@ -14,10 +14,15 @@
 """
 
 import argparse
+import datetime
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import threading
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -90,6 +95,103 @@ def _content_tree():
     return roots
 
 
+# ---------------------------------------------------------------------------
+# AI 리포트 생성 — claude CLI를 헤드리스(-p)로 호출해 실제 워크플로 가동
+# ---------------------------------------------------------------------------
+
+# 리포트 종류 → (skill 파일, 파일명 suffix, 타임아웃 초, 라벨)
+REPORT_KINDS = {
+    "checklist": ("investment-checklist.md", "checklist", 900, "빠른 체크리스트"),
+    "research": ("investment-research.md", "research", 1500, "종합 리서치"),
+    "team": ("investment-team.md", "team", 2400, "멀티에이전트 팀"),
+}
+
+JOBS = {}            # id -> dict(status, kind, code, name, started, path, error)
+JOBS_LOCK = threading.Lock()
+
+
+def _find_claude():
+    for cand in ("claude.cmd", "claude.exe", "claude"):
+        p = shutil.which(cand)
+        if p:
+            return p
+    return None
+
+
+CLAUDE_BIN = _find_claude()
+
+
+def _safe_name(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', "", (name or "").strip()) or "회사"
+
+
+def _build_prompt(kind: str, code: str, name: str) -> str:
+    skill_file = REPORT_KINDS[kind][0]
+    skill_path = os.path.join(REPO_ROOT, "skills", skill_file)
+    with open(skill_path, "r", encoding="utf-8") as f:
+        skill = f.read()
+    target = f"{name}({code})" if code else name
+    skill = skill.replace("$ARGUMENTS", target)
+    return (
+        f"너는 AI Berkshire 투자 리서치 애널리스트다. 분석 대상: {name}"
+        f"{f'(한국 KOSPI/KOSDAQ, 종목코드 {code})' if code else ''}.\n"
+        f"아래 워크플로 지침을 충실히 수행하라.\n\n"
+        f"=== 워크플로 지침 시작 ===\n{skill}\n=== 워크플로 지침 끝 ===\n\n"
+        f"[실행 규칙]\n"
+        f"- 모든 출력은 한국어로 작성한다.\n"
+        f"- 실제 수치가 필요하면 `python tools/krx_data.py quote|valuation|financials {code}`"
+        f" 와 WebSearch로 데이터를 확보하고 출처를 표기한다.\n"
+        f"- 객관성 원칙(사실/관점 구분, 양면 제시, 추정은 '추정' 명기)을 지킨다.\n"
+        f"- **파일을 직접 생성하지 말고, 완성된 리서치 리포트의 마크다운 본문만 최종 출력으로 반환하라.**"
+        f" (도구 로그·진행 설명 없이 리포트 본문만. 저장은 외부에서 처리한다.)\n"
+    )
+
+
+def _run_report_job(job_id: str, kind: str, code: str, name: str):
+    info = JOBS[job_id]
+    try:
+        prompt = _build_prompt(kind, code, name)
+        timeout = REPORT_KINDS[kind][2]
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        # claude.cmd 는 cmd /c 로 실행, 프롬프트는 stdin(마크다운 메타문자 안전)
+        cmd = [comspec, "/c", CLAUDE_BIN, "-p",
+               "--output-format", "text",
+               "--permission-mode", "bypassPermissions",
+               "--max-budget-usd", "4",
+               "--no-session-persistence"]
+        proc = subprocess.run(
+            cmd, input=prompt, capture_output=True, text=True, encoding="utf-8",
+            cwd=REPO_ROOT, timeout=timeout,
+        )
+        out = (proc.stdout or "").strip()
+        if proc.returncode != 0 and not out:
+            raise RuntimeError((proc.stderr or "claude 실행 실패").strip()[:500])
+        if not out:
+            raise RuntimeError("빈 결과(리포트 생성 실패)")
+
+        suffix = REPORT_KINDS[kind][1]
+        today = datetime.date.today().strftime("%Y%m%d")
+        safe = _safe_name(name)
+        out_dir = os.path.join(REPO_ROOT, "reports", safe)
+        os.makedirs(out_dir, exist_ok=True)
+        fname = f"{suffix}-{today}.md"
+        fname = f"{safe}-{fname}"
+        # 모델이 생성한 리포트 본문을 그대로 저장(스킬이 자체 제목 포함). 없으면 최소 헤더만.
+        body = out if "#" in out.split("\n", 1)[0] or out.lstrip().startswith("#") \
+            else f"# {name} {REPORT_KINDS[kind][3]} ({today})\n\n{out}"
+        with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
+            f.write(body)
+        rel = f"reports/{safe}/{fname}"
+        with JOBS_LOCK:
+            info.update(status="done", path=rel, chars=len(out))
+    except subprocess.TimeoutExpired:
+        with JOBS_LOCK:
+            info.update(status="error", error=f"시간 초과({REPORT_KINDS[kind][2]}초). 더 짧은 종류로 시도하세요.")
+    except Exception as e:
+        with JOBS_LOCK:
+            info.update(status="error", error=str(e)[:500])
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # 조용히
@@ -140,6 +242,25 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/krx/financials":
             return self._krx("api_financials", code=(qs.get("code") or [""])[0])
 
+        if path == "/api/report/status":
+            jid = (qs.get("id") or [""])[0]
+            with JOBS_LOCK:
+                job = JOBS.get(jid)
+            return self._send(200 if job else 404, job or {"error": "작업 없음"})
+
+        if path == "/api/report/jobs":
+            with JOBS_LOCK:
+                jobs = sorted(JOBS.values(), key=lambda j: j["started"], reverse=True)
+            return self._send(200, jobs[:20])
+
+        if path == "/api/report/available":
+            # claude CLI 사용 가능 여부 + 지원 종류
+            return self._send(200, {
+                "available": bool(CLAUDE_BIN),
+                "bin": CLAUDE_BIN,
+                "kinds": [{"id": k, "label": v[3]} for k, v in REPORT_KINDS.items()],
+            })
+
         # ---- 정적 파일 ----
         if path == "/" or path == "":
             path = "/index.html"
@@ -153,6 +274,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, data, _MIME.get(ext, "application/octet-stream"))
 
         self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/report/generate":
+            return self._send(404, {"error": "not found"})
+        if not CLAUDE_BIN:
+            return self._send(503, {"error": "claude CLI를 찾을 수 없습니다. Claude Code 설치 후 PATH 확인."})
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            return self._send(400, {"error": "잘못된 요청 본문"})
+
+        kind = body.get("kind", "research")
+        code = (body.get("code") or "").strip()
+        name = (body.get("name") or "").strip()
+        if kind not in REPORT_KINDS:
+            return self._send(400, {"error": f"지원하지 않는 종류: {kind}"})
+        if not name:
+            return self._send(400, {"error": "회사명(name)이 필요합니다."})
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id, "status": "running", "kind": kind,
+            "kindLabel": REPORT_KINDS[kind][3], "code": code, "name": name,
+            "started": datetime.datetime.now().isoformat(timespec="seconds"),
+            "path": None, "error": None,
+        }
+        with JOBS_LOCK:
+            JOBS[job_id] = job
+        threading.Thread(target=_run_report_job, args=(job_id, kind, code, name), daemon=True).start()
+        self._send(202, job)
 
 
 def main():

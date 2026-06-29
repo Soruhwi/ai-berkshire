@@ -102,6 +102,18 @@ table.fin thead th { background: var(--panel-2); }
 .report img { max-width: 100%; }
 .crumb { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
 
+/* AI 리포트 패널 */
+.ai-report { margin-top: 26px; padding: 18px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; }
+.ai-report h3 { margin: 0 0 6px; }
+.ai-controls { display: flex; gap: 10px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+.ai-controls select { padding: 8px 10px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+.ai-controls button { padding: 8px 18px; border-radius: 8px; border: none; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+.ai-controls button:disabled { opacity: .5; cursor: not-allowed; }
+.ai-status { min-height: 22px; font-size: 13px; }
+.ai-status a { font-weight: 600; }
+.spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; margin-right: 4px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
 .loading { color: var(--muted); padding: 30px 0; }
 .err { color: var(--up); }
 .hint { color: var(--muted); }

@@ -13,6 +13,7 @@ const DEFAULT_WATCHLIST = [
 
 const main = document.getElementById("main");
 let treeData = [];
+let reportCfg = { available: false, kinds: [] };
 
 // ---- 유틸 ----
 async function getJSON(url) {
@@ -134,11 +135,69 @@ async function showStock(code) {
     <h3>밸류에이션</h3>
     <div class="kv">${valItems.map(([k,val])=>`<div class="item"><div class="k">${k}</div><div class="v">${val}</div></div>`).join("")}</div>
     ${finHtml}
+    <div id="aiReport" class="ai-report"></div>
     <p class="hint" style="margin-top:18px">출처: 네이버금융 · krx_data.py · 체결 ${q.tradedAt || "-"}</p>
   </div>`;
   document.getElementById("backwl").onclick = (e) => { e.preventDefault(); showWatchlist(); };
   const ab = document.getElementById("addw");
   if (ab) ab.onclick = () => { addWatch({ code: q.code, name: q.name }); ab.remove(); };
+  renderReportPanel(q.code, q.name);
+}
+
+// ---- AI 리포트 생성 패널 ----
+function renderReportPanel(code, name) {
+  const box = document.getElementById("aiReport");
+  if (!box) return;
+  if (!reportCfg.available) {
+    box.innerHTML = `<h3>🤖 AI 리포트 생성</h3><p class="hint">claude CLI를 찾지 못해 비활성화됨. Claude Code 설치 후 서버를 재시작하세요.</p>`;
+    return;
+  }
+  const opts = reportCfg.kinds.map((k) => `<option value="${k.id}">${k.label}</option>`).join("");
+  box.innerHTML = `<h3>🤖 AI 리포트 생성</h3>
+    <p class="hint">4대가 워크플로를 실제로 가동해 ${name} 리포트를 생성하고 <code>reports/${name}/</code> 에 저장합니다. 종류에 따라 수 분 소요.</p>
+    <div class="ai-controls">
+      <select id="aiKind">${opts}</select>
+      <button id="aiGo">생성 시작</button>
+    </div>
+    <div id="aiStatus" class="ai-status"></div>`;
+  document.getElementById("aiGo").onclick = () => generateReport(code, name);
+}
+
+async function generateReport(code, name) {
+  const kind = document.getElementById("aiKind").value;
+  const btn = document.getElementById("aiGo");
+  const st = document.getElementById("aiStatus");
+  btn.disabled = true;
+  st.innerHTML = `<span class="spin"></span> 작업 생성 중…`;
+  let res;
+  try {
+    res = await fetch("/api/report/generate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, name, kind }),
+    }).then((r) => r.json());
+  } catch (e) { st.innerHTML = `<span class="err">요청 실패</span>`; btn.disabled = false; return; }
+  if (res.error) { st.innerHTML = `<span class="err">${res.error}</span>`; btn.disabled = false; return; }
+  pollReport(res.id, st, btn, Date.now());
+}
+
+function pollReport(id, st, btn, t0) {
+  const tick = async () => {
+    const j = await getJSON(`/api/report/status?id=${id}`).catch(() => null);
+    const secs = Math.round((Date.now() - t0) / 1000);
+    if (!j) { st.innerHTML = `<span class="err">상태 조회 실패</span>`; btn.disabled = false; return; }
+    if (j.status === "running") {
+      st.innerHTML = `<span class="spin"></span> 생성 중… (${j.kindLabel}, ${secs}초 경과) — 워크플로가 데이터를 수집/분석 중입니다.`;
+      setTimeout(tick, 3000);
+    } else if (j.status === "done") {
+      st.innerHTML = `✅ 완료 (${secs}초, ${j.chars.toLocaleString()}자) → <a href="#" id="openRep">리포트 열기</a> <span class="hint">${j.path}</span>`;
+      document.getElementById("openRep").onclick = (e) => { e.preventDefault(); loadTree().then(() => showReport(j.path)); };
+      btn.disabled = false;
+    } else {
+      st.innerHTML = `<span class="err">실패: ${j.error || "알 수 없음"}</span>`;
+      btn.disabled = false;
+    }
+  };
+  tick();
 }
 
 // ---- 리포트 트리 ----
@@ -225,8 +284,9 @@ function wireSearch() {
 }
 
 // ---- 시작 ----
-(function init() {
+(async function init() {
   if (window.marked) marked.setOptions({ gfm: true, breaks: false });
+  reportCfg = await getJSON("/api/report/available").catch(() => reportCfg);
   renderChips();
   loadTree();
   wireSearch();
