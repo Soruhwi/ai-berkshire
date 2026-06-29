@@ -1,5 +1,5 @@
 ---
-description: "AI Berkshire slash entry for 供应链瓶颈猎手：AI驱动的全球产业链瓶颈套利."
+description: "AI Berkshire slash entry for 공급망 병목 헌터: AI 기반 글로벌 산업체인 병목 차익거래."
 argument-hint: $ARGUMENTS
 ---
 
